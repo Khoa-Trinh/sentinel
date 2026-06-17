@@ -456,6 +456,23 @@ fn main() {
         }
     });
 
+    // Spawn background focus-stealing thread
+    std::thread::spawn(|| {
+        loop {
+            let is_locked = *LOCKOUT_ACTIVE.lock().unwrap();
+            let target_hwnd = if is_locked { get_egui_hwnd() } else { None };
+            if let Some(egui_hwnd) = target_hwnd {
+                let active_hwnd = unsafe { GetForegroundWindow() };
+                if active_hwnd != egui_hwnd {
+                    unsafe {
+                        let _ = SetForegroundWindow(egui_hwnd);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+
     // Run egui on the main thread
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
