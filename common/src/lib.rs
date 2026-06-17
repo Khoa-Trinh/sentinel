@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::process::{Child, Command};
 use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -9,6 +10,8 @@ pub type HANDLE = *mut std::ffi::c_void;
 pub type DWORD = u32;
 pub type BOOL = i32;
 pub type WCHAR = u16;
+
+pub static CTRL_C_PRESSED: AtomicBool = AtomicBool::new(false);
 
 #[allow(non_snake_case)]
 #[repr(C)]
@@ -39,12 +42,15 @@ unsafe extern "system" {
     fn SetConsoleCtrlHandler(HandlerRoutine: Option<PHANDLER_ROUTINE>, Add: BOOL) -> BOOL;
 }
 
-unsafe extern "system" fn ctrl_handler(_ctrl_type: DWORD) -> BOOL {
-    // Exit cleanly with code 0 so the companion knows we intended to stop
-    std::process::exit(0);
+unsafe extern "system" fn ctrl_handler(ctrl_type: DWORD) -> BOOL {
+    if ctrl_type == 0 || ctrl_type == 1 { // CTRL_C_EVENT or CTRL_BREAK_EVENT
+        CTRL_C_PRESSED.store(true, Ordering::SeqCst);
+        std::process::exit(0);
+    }
+    1 // Return TRUE to indicate the signal is handled or let default run
 }
 
-/// Registers a custom console control handler that exits cleanly on Ctrl+C / close signals.
+/// Registers a custom console control handler that sets CTRL_C_PRESSED and exits cleanly.
 pub fn setup_ctrl_handler() {
     unsafe {
         SetConsoleCtrlHandler(Some(ctrl_handler), 1);

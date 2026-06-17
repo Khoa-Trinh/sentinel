@@ -1,0 +1,13 @@
+{
+  "whitelist": [
+    "explorer.exe",
+    "tracker.exe",
+    "guardian.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "conhost.exe"
+  ],
+  "limit_seconds": 10,
+  "start_hour": 22,
+  "end_hour": 6
+}

@@ -849,9 +849,15 @@ fn main() {
         ..Default::default()
     };
 
-    let _ = eframe::run_native(
+    let exit_result = eframe::run_native(
         "Sentinel Lockout Overlay",
         options,
         Box::new(|_cc| Ok(Box::new(LockoutOverlayApp))),
     );
+
+    if exit_result.is_ok() && enable_kill && common::CTRL_C_PRESSED.load(std::sync::atomic::Ordering::SeqCst) {
+        std::process::exit(0);
+    } else {
+        std::process::exit(1);
+    }
 }
