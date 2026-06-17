@@ -7,7 +7,7 @@ use std::time::Duration;
 use fs2::FileExt;
 
 use windows::core::{Interface, PWSTR};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioSessionControl2, IAudioSessionManager2,
     IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -28,8 +28,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINF
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
     GetWindowThreadProcessId, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWL_STYLE, MSG,
-    WINEVENT_OUTOFCONTEXT,
+    WINEVENT_OUTOFCONTEXT, GetWindowRect, SetWindowPos, SetForegroundWindow,
+    HWND_TOPMOST, SWP_SHOWWINDOW, SWP_HIDEWINDOW, FindWindowW,
 };
+
+// Thread-safe wrapper for HWND to allow storage in lazy/global statics
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SendHwnd(HWND);
+
+unsafe impl Send for SendHwnd {}
+unsafe impl Sync for SendHwnd {}
+
+// Global states to coordinate lockout overlay
+static LOCKOUT_ACTIVE: Mutex<bool> = Mutex::new(false);
+static TARGET_HWND: Mutex<SendHwnd> = Mutex::new(SendHwnd(HWND(std::ptr::null_mut())));
 
 // Thread-safe memory structure to log foreground window executable names
 static LOGGED_PROCESSES: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -166,7 +178,6 @@ fn is_foreground_process_streaming_audio(foreground_pid: u32) -> bool {
             Err(_) => return false,
         };
 
-
         // Activate IAudioSessionManager2 on the device
         // Activate signature in windows crate takes dwclscontext (u32) and null pointer parameter
         let session_manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
@@ -224,6 +235,14 @@ fn is_foreground_process_streaming_audio(foreground_pid: u32) -> bool {
     false
 }
 
+/// Helper to get the egui window handle by its title.
+fn get_egui_hwnd() -> Option<HWND> {
+    unsafe {
+        let title: Vec<u16> = "Sentinel Lockout Overlay\0".encode_utf16().collect();
+        FindWindowW(None, windows::core::PCWSTR(title.as_ptr())).ok()
+    }
+}
+
 /// Manages monotonic active tracking time
 struct ActiveTracker {
     last_check: std::time::Instant,
@@ -256,6 +275,76 @@ impl ActiveTracker {
                 self.total_active_duration.as_secs_f64()
             );
         }
+    }
+}
+
+struct LockoutOverlayApp;
+
+impl eframe::App for LockoutOverlayApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        let is_locked = *LOCKOUT_ACTIVE.lock().unwrap();
+        if is_locked {
+            [0.12, 0.0, 0.0, 0.7] // Semi-transparent dark red background
+        } else {
+            [0.0, 0.0, 0.0, 0.0] // Completely transparent
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Request repaint continuously to update overlay positions and transparency
+        ui.ctx().request_repaint();
+
+        let is_locked = *LOCKOUT_ACTIVE.lock().unwrap();
+        if !is_locked {
+            // Keep offscreen or hidden when not locked out
+            unsafe {
+                if let Some(egui_hwnd) = get_egui_hwnd() {
+                    let _ = SetWindowPos(
+                        egui_hwnd,
+                        None,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_HIDEWINDOW,
+                    );
+                }
+            }
+            return;
+        }
+
+        // Lockout is active. Place overlay directly over target application bounds.
+        let target = TARGET_HWND.lock().unwrap().0;
+        unsafe {
+            if let Some(egui_hwnd) = get_egui_hwnd() {
+                let mut rect = RECT::default();
+                if !target.0.is_null() && GetWindowRect(target, &mut rect).is_ok() {
+                    let x = rect.left;
+                    let y = rect.top;
+                    let w = rect.right - rect.left;
+                    let h = rect.bottom - rect.top;
+                    let _ = SetWindowPos(
+                        egui_hwnd,
+                        Some(HWND_TOPMOST),
+                        x,
+                        y,
+                        w,
+                        h,
+                        SWP_SHOWWINDOW,
+                    );
+                }
+            }
+        }
+
+        // Draw lockout UI content centered inside the window
+        ui.centered_and_justified(|ui| {
+            ui.heading(
+                egui::RichText::new("LOCKOUT ACTIVE\nUsage Time Limit Exceeded!")
+                    .color(egui::Color32::RED)
+                    .size(32.0)
+                    .strong()
+            );
+        });
     }
 }
 
@@ -326,41 +415,61 @@ fn main() {
         tx,
     );
 
-    let mut tracker = ActiveTracker::new();
+    // Spawn background watchdog and user idle tracker thread
+    std::thread::spawn(move || {
+        let mut tracker = ActiveTracker::new();
 
-    // Event loop in the main thread with a 1-second timeout
-    loop {
-        match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(event) => {
-                println!("[TRACKER] Event: {:?}", event);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Periodically check idle state and tick the tracker
-                let idle_ms = get_user_idle_ms().unwrap_or(0);
-                
-                // Get foreground application PID
-                let foreground_pid = get_foreground_process_id();
-                
-                // Check if foreground application is streaming audio
-                let is_streaming_audio = is_foreground_process_streaming_audio(foreground_pid);
-                
-                // 3 minutes threshold (180,000 ms)
-                // If user is idle but actively streaming audio, do NOT pause
-                let is_idle = idle_ms >= 180_000 && !is_streaming_audio;
-                
-                if is_streaming_audio && idle_ms >= 180_000 {
-                    println!(
-                        "[TRACKER] User is idle for {}ms but foreground process PID {} is actively streaming audio. Mitigating idle state.",
-                        idle_ms, foreground_pid
-                    );
+        loop {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(event) => {
+                    println!("[TRACKER] Event: {:?}", event);
                 }
-                
-                tracker.tick(is_idle);
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                println!("[TRACKER] Watchdog channel disconnected. Exiting loop.");
-                break;
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let idle_ms = get_user_idle_ms().unwrap_or(0);
+                    let foreground_pid = get_foreground_process_id();
+                    let is_streaming_audio = is_foreground_process_streaming_audio(foreground_pid);
+                    let is_idle = idle_ms >= 180_000 && !is_streaming_audio;
+                    
+                    tracker.tick(is_idle);
+
+                    // Check active usage time limit lockout rule (e.g. 10 seconds active usage)
+                    if tracker.total_active_duration >= Duration::from_secs(10) {
+                        let mut lockout = LOCKOUT_ACTIVE.lock().unwrap();
+                        if !*lockout {
+                            *lockout = true;
+                            println!("[TRACKER] Lockout rule violated! Activating overlay...");
+                            
+                            unsafe {
+                                let fg_hwnd = GetForegroundWindow();
+                                if !fg_hwnd.0.is_null() {
+                                    *TARGET_HWND.lock().unwrap() = SendHwnd(fg_hwnd);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    println!("[TRACKER] Watchdog channel disconnected. Exiting loop.");
+                    break;
+                }
             }
         }
-    }
+    });
+
+    // Run egui on the main thread
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Sentinel Lockout Overlay")
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_active(true),
+        ..Default::default()
+    };
+
+    let _ = eframe::run_native(
+        "Sentinel Lockout Overlay",
+        options,
+        Box::new(|_cc| Ok(Box::new(LockoutOverlayApp))),
+    );
 }
