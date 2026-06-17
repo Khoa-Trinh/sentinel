@@ -28,11 +28,27 @@ pub struct PROCESSENTRY32W {
 const TH32CS_SNAPPROCESS: DWORD = 0x00000002;
 const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
 
+#[allow(non_camel_case_types, non_snake_case)]
+pub type PHANDLER_ROUTINE = unsafe extern "system" fn(dwCtrlType: DWORD) -> BOOL;
+
 unsafe extern "system" {
     fn CreateToolhelp32Snapshot(dwFlags: DWORD, th32ProcessID: DWORD) -> HANDLE;
     fn Process32FirstW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
     fn Process32NextW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
     fn CloseHandle(hObject: HANDLE) -> BOOL;
+    fn SetConsoleCtrlHandler(HandlerRoutine: Option<PHANDLER_ROUTINE>, Add: BOOL) -> BOOL;
+}
+
+unsafe extern "system" fn ctrl_handler(_ctrl_type: DWORD) -> BOOL {
+    // Exit cleanly with code 0 so the companion knows we intended to stop
+    std::process::exit(0);
+}
+
+/// Registers a custom console control handler that exits cleanly on Ctrl+C / close signals.
+pub fn setup_ctrl_handler() {
+    unsafe {
+        SetConsoleCtrlHandler(Some(ctrl_handler), 1);
+    }
 }
 
 /// Check if a process is running by its executable name (case-insensitive).
@@ -80,10 +96,10 @@ pub fn is_process_running(name: &str) -> bool {
 }
 
 /// Spawn a process with the given target name, located in the same directory as the current executable.
-pub fn spawn_process(target_name: &str) -> std::io::Result<Child> {
+pub fn spawn_process(target_name: &str, args: &[String]) -> std::io::Result<Child> {
     let mut exe_path = std::env::current_exe()?;
     exe_path.set_file_name(target_name);
-    Command::new(exe_path).spawn()
+    Command::new(exe_path).args(args).spawn()
 }
 
 /// Watchdog events sent via mpsc channel.
@@ -102,6 +118,7 @@ pub fn start_watchdog(
     my_name: String,
     target_name: String,
     interval: Duration,
+    enable_kill: bool,
     tx: Sender<WatchdogEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -118,6 +135,10 @@ pub fn start_watchdog(
                         let status_str = status.to_string();
                         let _ = tx.send(WatchdogEvent::ProcessExited(target_name.clone(), status_str));
                         child = None;
+                        if enable_kill && status.success() {
+                            println!("[{}] Companion exited cleanly. Exiting watchdog.", my_name);
+                            std::process::exit(0);
+                        }
                         needs_spawn = true;
                     }
                     Ok(None) => {
@@ -150,7 +171,12 @@ pub fn start_watchdog(
             }
 
             if needs_spawn {
-                match spawn_process(&target_name) {
+                let child_args = if enable_kill {
+                    vec!["--enable-kill".to_string()]
+                } else {
+                    vec![]
+                };
+                match spawn_process(&target_name, &child_args) {
                     Ok(c) => {
                         let _ = tx.send(WatchdogEvent::ProcessSpawned(target_name.clone()));
                         child = Some(c);

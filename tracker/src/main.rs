@@ -616,6 +616,14 @@ impl eframe::App for LockoutOverlayApp {
 fn main() {
     println!("[TRACKER] Watchdog agent starting up...");
 
+    let args: Vec<String> = std::env::args().collect();
+    let enable_kill = args.iter().any(|arg| arg == "--enable-kill");
+
+    if enable_kill {
+        println!("[TRACKER] Enable-kill mode active. Registering Ctrl+C handler...");
+        common::setup_ctrl_handler();
+    }
+
     // Enforce exclusive file lock on config.json
     let config_file = match OpenOptions::new()
         .read(true)
@@ -677,6 +685,7 @@ fn main() {
         "tracker".to_string(),
         "guardian.exe".to_string(),
         Duration::from_millis(500),
+        enable_kill,
         tx,
     );
 
