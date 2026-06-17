@@ -6,8 +6,16 @@ use std::sync::Mutex;
 use std::time::Duration;
 use fs2::FileExt;
 
-use windows::core::PWSTR;
+use windows::core::{Interface, PWSTR};
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Media::Audio::{
+    eConsole, eRender, IAudioSessionControl2, IAudioSessionManager2,
+    IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+};
+use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
@@ -18,9 +26,9 @@ use windows::Win32::UI::Accessibility::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetClassNameW, GetMessageW, GetWindowLongPtrW,
-    GetWindowThreadProcessId, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWL_STYLE,
-    MSG, WINEVENT_OUTOFCONTEXT,
+    DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
+    GetWindowThreadProcessId, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWL_STYLE, MSG,
+    WINEVENT_OUTOFCONTEXT,
 };
 
 // Thread-safe memory structure to log foreground window executable names
@@ -121,6 +129,99 @@ fn get_user_idle_ms() -> Option<u32> {
             None
         }
     }
+}
+
+/// Helper to get the active foreground process ID.
+fn get_foreground_process_id() -> u32 {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return 0;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        pid
+    }
+}
+
+/// Helper to check if the current foreground process is actively streaming audio (peak > 0.0).
+fn is_foreground_process_streaming_audio(foreground_pid: u32) -> bool {
+    if foreground_pid == 0 {
+        return false;
+    }
+
+    unsafe {
+        // Initialize COM (safe to call repeatedly)
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+        // Get IMMDeviceEnumerator
+        let enumerator: IMMDeviceEnumerator = match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+
+        // Get default audio endpoint device
+        let device: IMMDevice = match enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+
+
+        // Activate IAudioSessionManager2 on the device
+        // Activate signature in windows crate takes dwclscontext (u32) and null pointer parameter
+        let session_manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+            Ok(sm) => sm,
+            Err(_) => return false,
+        };
+
+        // Get session enumerator
+        let session_enumerator = match session_manager.GetSessionEnumerator() {
+            Ok(se) => se,
+            Err(_) => return false,
+        };
+
+        let count = match session_enumerator.GetCount() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        for i in 0..count {
+            let session_control = match session_enumerator.GetSession(i) {
+                Ok(sc) => sc,
+                Err(_) => continue,
+            };
+
+            // Cast to IAudioSessionControl2 to get Process ID
+            let session_control2: IAudioSessionControl2 = match session_control.cast() {
+                Ok(sc2) => sc2,
+                Err(_) => continue,
+            };
+
+            let pid = match session_control2.GetProcessId() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if pid == foreground_pid {
+                // Cast to IAudioMeterInformation to query peak audio level
+                let meter_info: IAudioMeterInformation = match session_control.cast() {
+                    Ok(mi) => mi,
+                    Err(_) => continue,
+                };
+
+                let peak = match meter_info.GetPeakValue() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                if peak > 0.0 {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// Manages monotonic active tracking time
@@ -236,8 +337,24 @@ fn main() {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Periodically check idle state and tick the tracker
                 let idle_ms = get_user_idle_ms().unwrap_or(0);
+                
+                // Get foreground application PID
+                let foreground_pid = get_foreground_process_id();
+                
+                // Check if foreground application is streaming audio
+                let is_streaming_audio = is_foreground_process_streaming_audio(foreground_pid);
+                
                 // 3 minutes threshold (180,000 ms)
-                let is_idle = idle_ms >= 180_000;
+                // If user is idle but actively streaming audio, do NOT pause
+                let is_idle = idle_ms >= 180_000 && !is_streaming_audio;
+                
+                if is_streaming_audio && idle_ms >= 180_000 {
+                    println!(
+                        "[TRACKER] User is idle for {}ms but foreground process PID {} is actively streaming audio. Mitigating idle state.",
+                        idle_ms, foreground_pid
+                    );
+                }
+                
                 tracker.tick(is_idle);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
