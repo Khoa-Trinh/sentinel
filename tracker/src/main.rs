@@ -6,8 +6,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 use fs2::FileExt;
 
-use windows::core::{Interface, PWSTR};
+use windows::core::{Interface, PWSTR, PCWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY_CURRENT_USER,
+    KEY_READ, KEY_WRITE, REG_BINARY, REG_SZ, HKEY, REG_VALUE_TYPE,
+};
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioSessionControl2, IAudioSessionManager2,
     IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -235,6 +239,267 @@ fn is_foreground_process_streaming_audio(foreground_pid: u32) -> bool {
     false
 }
 
+struct AppConfig {
+    whitelist: Vec<String>,
+    limit_seconds: u64,
+    start_hour: Option<u32>,
+    end_hour: Option<u32>,
+}
+
+fn parse_config(content: &str) -> AppConfig {
+    let mut whitelist = vec![
+        "explorer.exe".to_string(),
+        "tracker.exe".to_string(),
+        "guardian.exe".to_string(),
+        "cmd.exe".to_string(),
+        "powershell.exe".to_string(),
+        "conhost.exe".to_string(),
+    ];
+    let mut limit_seconds = 1800; // default 30 mins
+    let mut start_hour = None;
+    let mut end_hour = None;
+
+    let wl_block = content.find("\"whitelist\"").and_then(|w_pos| {
+        content[w_pos..].find('[').map(|start_bracket| (w_pos, start_bracket))
+    });
+    if let Some((w_pos, start_bracket)) = wl_block {
+        let abs_start = w_pos + start_bracket;
+        if let Some(end_bracket) = content[abs_start..].find(']') {
+            let abs_end = abs_start + end_bracket;
+            let array_str = &content[abs_start + 1..abs_end];
+            let parsed_list: Vec<String> = array_str
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parsed_list.is_empty() {
+                whitelist = parsed_list;
+            }
+        }
+    }
+
+    if let Some(l_pos) = content.find("\"limit_seconds\"") {
+        let after = &content[l_pos + "\"limit_seconds\"".len()..];
+        if let Some(colon_pos) = after.find(':') {
+            let after_colon = &after[colon_pos + 1..];
+            let num_str: String = after_colon
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || c.is_whitespace())
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            if let Ok(val) = num_str.parse::<u64>() {
+                limit_seconds = val;
+            }
+        }
+    }
+
+    if let Some(sh_pos) = content.find("\"start_hour\"") {
+        let after = &content[sh_pos + "\"start_hour\"".len()..];
+        if let Some(colon_pos) = after.find(':') {
+            let after_colon = &after[colon_pos + 1..];
+            let num_str: String = after_colon
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || c.is_whitespace())
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            if let Ok(val) = num_str.parse::<u32>() {
+                start_hour = Some(val);
+            }
+        }
+    }
+
+    if let Some(eh_pos) = content.find("\"end_hour\"") {
+        let after = &content[eh_pos + "\"end_hour\"".len()..];
+        if let Some(colon_pos) = after.find(':') {
+            let after_colon = &after[colon_pos + 1..];
+            let num_str: String = after_colon
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || c.is_whitespace())
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            if let Ok(val) = num_str.parse::<u32>() {
+                end_hour = Some(val);
+            }
+        }
+    }
+
+    AppConfig {
+        whitelist,
+        limit_seconds,
+        start_hour,
+        end_hour,
+    }
+}
+
+fn get_process_name_by_pid(pid: u32) -> String {
+    if pid == 0 {
+        return String::new();
+    }
+    unsafe {
+        if let Ok(process_handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            let mut buffer = [0u16; 1024];
+            let mut size = buffer.len() as u32;
+            let success = QueryFullProcessImageNameW(
+                process_handle,
+                PROCESS_NAME_FORMAT(0),
+                PWSTR(buffer.as_mut_ptr()),
+                &mut size,
+            );
+            let _ = windows::Win32::Foundation::CloseHandle(process_handle);
+
+            if success.is_ok() {
+                let full_path = String::from_utf16_lossy(&buffer[..size as usize]);
+                if let Some(exe_name) = Path::new(&full_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                {
+                    return exe_name.to_string();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+fn is_system_window(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return true;
+    }
+    unsafe {
+        let mut class_name = [0u16; 256];
+        let len = GetClassNameW(hwnd, &mut class_name);
+        if len == 0 {
+            return false;
+        }
+        let class_name_str = String::from_utf16_lossy(&class_name[..len as usize]);
+        class_name_str == "Shell_TrayWnd"
+            || class_name_str == "Progman"
+            || class_name_str == "WorkerW"
+            || class_name_str == "Windows.UI.Core.CoreWindow"
+    }
+}
+
+fn is_within_restricted_hours(start: u32, end: u32) -> bool {
+    let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    let hour = st.wHour as u32;
+    if start <= end {
+        hour >= start && hour < end
+    } else {
+        hour >= start || hour < end
+    }
+}
+
+fn heal_registry() {
+    unsafe {
+        let run_key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0".encode_utf16().collect();
+        let mut hkey_run = HKEY::default();
+        
+        let current_exe = std::env::current_exe().unwrap_or_default();
+        let current_exe_str = current_exe.to_string_lossy();
+        let expected_value = format!("\"{}\"", current_exe_str);
+        let expected_wide: Vec<u16> = format!("{}\0", expected_value).encode_utf16().collect();
+        let value_name: Vec<u16> = "SentinelTracker\0".encode_utf16().collect();
+
+        // 1. Maintain Run key entry
+        let status = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(run_key_path.as_ptr()),
+            Some(0),
+            KEY_READ | KEY_WRITE,
+            &mut hkey_run,
+        );
+        
+        if status.is_ok() {
+            let mut val_type = REG_VALUE_TYPE::default();
+            let mut buffer = [0u8; 1024];
+            let mut cb_data = buffer.len() as u32;
+
+            let query_status = RegQueryValueExW(
+                hkey_run,
+                PCWSTR(value_name.as_ptr()),
+                None,
+                Some(&mut val_type as *mut REG_VALUE_TYPE),
+                Some(buffer.as_mut_ptr()),
+                Some(&mut cb_data as *mut u32),
+            );
+
+            let mut needs_write = false;
+            if query_status.is_err() || val_type != REG_SZ {
+                needs_write = true;
+            } else {
+                let wide_chars = std::slice::from_raw_parts(
+                    buffer.as_ptr() as *const u16,
+                    (cb_data as usize) / 2,
+                );
+                let mut actual_str = String::from_utf16_lossy(wide_chars);
+                if let Some(null_idx) = actual_str.find('\0') {
+                    actual_str.truncate(null_idx);
+                }
+                if actual_str != expected_value {
+                    needs_write = true;
+                }
+            }
+
+            if needs_write {
+                let _ = RegSetValueExW(
+                    hkey_run,
+                    PCWSTR(value_name.as_ptr()),
+                    Some(0),
+                    REG_SZ,
+                    Some(std::slice::from_raw_parts(
+                        expected_wide.as_ptr() as *const u8,
+                        expected_wide.len() * 2,
+                    )),
+                );
+                println!("[TRACKER] Registry startup Run path repaired to: {}", expected_value);
+            }
+            let _ = RegCloseKey(hkey_run);
+        }
+
+        // 2. Counter Task Manager Startup Disable (StartupApproved\Run)
+        let approved_key_path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run\0"
+            .encode_utf16()
+            .collect();
+        let mut hkey_approved = HKEY::default();
+        let status_approved = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(approved_key_path.as_ptr()),
+            Some(0),
+            KEY_READ | KEY_WRITE,
+            &mut hkey_approved,
+        );
+
+        if status_approved.is_ok() {
+            let mut val_type = REG_VALUE_TYPE::default();
+            let mut buffer = [0u8; 128];
+            let mut cb_data = buffer.len() as u32;
+
+            let query_status = RegQueryValueExW(
+                hkey_approved,
+                PCWSTR(value_name.as_ptr()),
+                None,
+                Some(&mut val_type as *mut REG_VALUE_TYPE),
+                Some(buffer.as_mut_ptr()),
+                Some(&mut cb_data as *mut u32),
+            );
+
+            if query_status.is_ok() && cb_data > 0 && buffer[0] != 2 {
+                let mut enabled_bytes = [0u8; 12];
+                enabled_bytes[0] = 2;
+                let _ = RegSetValueExW(
+                    hkey_approved,
+                    PCWSTR(value_name.as_ptr()),
+                    Some(0),
+                    REG_BINARY,
+                    Some(&enabled_bytes),
+                );
+                println!("[TRACKER] StartupApproved state repaired to Enabled");
+            }
+            let _ = RegCloseKey(hkey_approved);
+        }
+    }
+}
+
 /// Helper to get the egui window handle by its title.
 fn get_egui_hwnd() -> Option<HWND> {
     unsafe {
@@ -352,7 +617,7 @@ fn main() {
     println!("[TRACKER] Watchdog agent starting up...");
 
     // Enforce exclusive file lock on config.json
-    let _config_file = match OpenOptions::new()
+    let config_file = match OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
@@ -418,8 +683,57 @@ fn main() {
     // Spawn background watchdog and user idle tracker thread
     std::thread::spawn(move || {
         let mut tracker = ActiveTracker::new();
+        let mut file = config_file;
 
         loop {
+            // Self-healing startup run keys
+            heal_registry();
+
+            // Load and parse configuration from config.json
+            let mut config = AppConfig {
+                whitelist: vec![
+                    "explorer.exe".to_string(),
+                    "tracker.exe".to_string(),
+                    "guardian.exe".to_string(),
+                    "cmd.exe".to_string(),
+                    "powershell.exe".to_string(),
+                    "conhost.exe".to_string(),
+                ],
+                limit_seconds: 10,
+                start_hour: None,
+                end_hour: None,
+            };
+
+            if let Some(ref mut f) = file {
+                use std::io::{Read, Seek, SeekFrom, Write};
+                let mut content = String::new();
+                let _ = f.seek(SeekFrom::Start(0));
+                let _ = f.read_to_string(&mut content);
+
+                if content.trim().is_empty() {
+                    let default_config = r#"{
+  "whitelist": [
+    "explorer.exe",
+    "tracker.exe",
+    "guardian.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "conhost.exe"
+  ],
+  "limit_seconds": 10,
+  "start_hour": 22,
+  "end_hour": 6
+}"#;
+                    let _ = f.set_len(0);
+                    let _ = f.seek(SeekFrom::Start(0));
+                    let _ = f.write_all(default_config.as_bytes());
+                    let _ = f.flush();
+                    content = default_config.to_string();
+                }
+
+                config = parse_config(&content);
+            }
+
             match rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(event) => {
                     println!("[TRACKER] Event: {:?}", event);
@@ -432,19 +746,61 @@ fn main() {
                     
                     tracker.tick(is_idle);
 
-                    // Check active usage time limit lockout rule (e.g. 10 seconds active usage)
-                    if tracker.total_active_duration >= Duration::from_secs(10) {
-                        let mut lockout = LOCKOUT_ACTIVE.lock().unwrap();
-                        if !*lockout {
-                            *lockout = true;
-                            println!("[TRACKER] Lockout rule violated! Activating overlay...");
-                            
-                            unsafe {
-                                let fg_hwnd = GetForegroundWindow();
-                                if !fg_hwnd.0.is_null() {
-                                    *TARGET_HWND.lock().unwrap() = SendHwnd(fg_hwnd);
+                    // Check restriction profile
+                    let time_limit_exceeded = tracker.total_active_duration >= Duration::from_secs(config.limit_seconds);
+                    let in_restricted_hours = if let (Some(start), Some(end)) = (config.start_hour, config.end_hour) {
+                        is_within_restricted_hours(start, end)
+                    } else {
+                        false
+                    };
+
+                    let restriction_profile_active = time_limit_exceeded || in_restricted_hours;
+
+                    if restriction_profile_active {
+                        let fg_hwnd = unsafe { GetForegroundWindow() };
+                        let egui_hwnd = get_egui_hwnd();
+
+                        if let Some(eh) = egui_hwnd {
+                            if fg_hwnd == eh {
+                                // Already showing overlay, do nothing to avoid flashing loop
+                            } else if is_system_window(fg_hwnd) {
+                                // It's a system component, do not block it
+                                let mut lockout = LOCKOUT_ACTIVE.lock().unwrap();
+                                *lockout = false;
+                            } else {
+                                let exe_name = get_process_name_by_pid(get_foreground_process_id());
+                                let is_whitelisted = config.whitelist.iter().any(|w| w.eq_ignore_ascii_case(&exe_name));
+                                let mut lockout = LOCKOUT_ACTIVE.lock().unwrap();
+                                if !is_whitelisted {
+                                    if !*lockout {
+                                        *lockout = true;
+                                        println!("[TRACKER] Default-Deny: blocked non-whitelisted foreground window '{}'", exe_name);
+                                        *TARGET_HWND.lock().unwrap() = SendHwnd(fg_hwnd);
+                                    }
+                                } else {
+                                    // Whitelisted app focused, hide overlay
+                                    *lockout = false;
                                 }
                             }
+                        } else {
+                            let fg_hwnd = unsafe { GetForegroundWindow() };
+                            if !fg_hwnd.0.is_null() && !is_system_window(fg_hwnd) {
+                                let exe_name = get_process_name_by_pid(get_foreground_process_id());
+                                let is_whitelisted = config.whitelist.iter().any(|w| w.eq_ignore_ascii_case(&exe_name));
+                                if !is_whitelisted {
+                                    let mut lockout = LOCKOUT_ACTIVE.lock().unwrap();
+                                    if !*lockout {
+                                        *lockout = true;
+                                        *TARGET_HWND.lock().unwrap() = SendHwnd(fg_hwnd);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let mut lockout = LOCKOUT_ACTIVE.lock().unwrap();
+                        if *lockout {
+                            *lockout = false;
+                            println!("[TRACKER] Restriction profile inactive. Hiding overlay.");
                         }
                     }
                 }
