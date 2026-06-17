@@ -1,3 +1,20 @@
+use std::sync::mpsc;
+use std::time::Duration;
+
 fn main() {
-    println!("Hello, world!");
+    println!("[TRACKER] Watchdog agent starting up...");
+    let (tx, rx) = mpsc::channel();
+
+    // Start background thread monitoring guardian.exe
+    let _handle = common::start_watchdog(
+        "tracker".to_string(),
+        "guardian.exe".to_string(),
+        Duration::from_millis(500),
+        tx,
+    );
+
+    // Process events from the watchdog thread
+    while let Ok(event) = rx.recv() {
+        println!("[TRACKER] Event: {:?}", event);
+    }
 }

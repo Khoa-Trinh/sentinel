@@ -3,9 +3,19 @@
 version = 4
 
 [[package]]
+name = "common"
+version = "0.1.0"
+
+[[package]]
 name = "guardian"
 version = "0.1.0"
+dependencies = [
+ "common",
+]
 
 [[package]]
 name = "tracker"
 version = "0.1.0"
+dependencies = [
+ "common",
+]
