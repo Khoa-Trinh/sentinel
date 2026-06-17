@@ -8,6 +8,7 @@ use fs2::FileExt;
 
 use windows::core::PWSTR;
 use windows::Win32::Foundation::HWND;
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
     PROCESS_QUERY_LIMITED_INFORMATION,
@@ -15,6 +16,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Accessibility::{
     SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetClassNameW, GetMessageW, GetWindowLongPtrW,
     GetWindowThreadProcessId, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWL_STYLE,
@@ -105,6 +107,57 @@ unsafe extern "system" fn wineventproc(
     }
 }
 
+/// Helper to get the current user idle time in milliseconds using GetLastInputInfo.
+fn get_user_idle_ms() -> Option<u32> {
+    let mut lii = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    unsafe {
+        if GetLastInputInfo(&mut lii).as_bool() {
+            let current_tick = GetTickCount();
+            Some(current_tick.wrapping_sub(lii.dwTime))
+        } else {
+            None
+        }
+    }
+}
+
+/// Manages monotonic active tracking time
+struct ActiveTracker {
+    last_check: std::time::Instant,
+    total_active_duration: Duration,
+}
+
+impl ActiveTracker {
+    fn new() -> Self {
+        Self {
+            last_check: std::time::Instant::now(),
+            total_active_duration: Duration::from_secs(0),
+        }
+    }
+
+    fn tick(&mut self, is_idle: bool) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_check);
+        self.last_check = now;
+
+        if !is_idle {
+            self.total_active_duration += elapsed;
+            println!(
+                "[TRACKER] User Active. Elapsed: {:.2}s. Total Monotonic Active Time: {:.2}s",
+                elapsed.as_secs_f64(),
+                self.total_active_duration.as_secs_f64()
+            );
+        } else {
+            println!(
+                "[TRACKER] User Idle (>= 3m). Active tracking paused. Total Monotonic Active Time: {:.2}s",
+                self.total_active_duration.as_secs_f64()
+            );
+        }
+    }
+}
+
 fn main() {
     println!("[TRACKER] Watchdog agent starting up...");
 
@@ -172,8 +225,25 @@ fn main() {
         tx,
     );
 
-    // Process events from the watchdog thread
-    while let Ok(event) = rx.recv() {
-        println!("[TRACKER] Event: {:?}", event);
+    let mut tracker = ActiveTracker::new();
+
+    // Event loop in the main thread with a 1-second timeout
+    loop {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(event) => {
+                println!("[TRACKER] Event: {:?}", event);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Periodically check idle state and tick the tracker
+                let idle_ms = get_user_idle_ms().unwrap_or(0);
+                // 3 minutes threshold (180,000 ms)
+                let is_idle = idle_ms >= 180_000;
+                tracker.tick(is_idle);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                println!("[TRACKER] Watchdog channel disconnected. Exiting loop.");
+                break;
+            }
+        }
     }
 }
